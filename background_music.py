@@ -21,7 +21,7 @@ try:
         from PyQt6.QtWidgets import (QWidget, QDialog, QVBoxLayout, QHBoxLayout,
                                      QPushButton, QLabel, QSlider, QComboBox, QFrame,
                                      QLineEdit, QFileDialog)
-        from PyQt6.QtGui import QAction, QIcon, QPixmap
+        from PyQt6.QtGui import QAction, QIcon, QPixmap, QPainter, QColor, QFont, QPen
         from PyQt6.QtCore import QUrl, Qt, QSize, QTimer
         from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
         _has_multimedia = True
@@ -31,7 +31,7 @@ try:
         from PyQt5.QtWidgets import (QWidget, QDialog, QVBoxLayout, QHBoxLayout,
                                      QPushButton, QLabel, QSlider, QComboBox, QFrame,
                                      QLineEdit, QFileDialog)
-        from PyQt5.QtGui import QAction, QIcon, QPixmap
+        from PyQt5.QtGui import QAction, QIcon, QPixmap, QPainter, QColor, QFont, QPen
         from PyQt5.QtCore import QUrl, Qt, QSize, QTimer
         try:
             from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
@@ -46,6 +46,33 @@ try:
 except ImportError:
     _has_multimedia = False
     QDialog = object
+
+# --- QtWebEngine (for streaming services: SoundCloud / YouTube Music) ---
+_has_webengine = False
+try:
+    if constants.qt_version == 6:
+        from PyQt6.QtWebEngineWidgets import QWebEngineView
+        from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
+        _has_webengine = True
+    elif constants.qt_version == 5:
+        from PyQt5.QtWebEngineWidgets import (
+            QWebEngineView, QWebEngineProfile, QWebEnginePage,
+        )
+        _has_webengine = True
+except ImportError:
+    _has_webengine = False
+    QWebEngineView = QWebEngineProfile = QWebEnginePage = object  # type: ignore
+
+# --- QtNetwork (fetching track artwork) ---
+try:
+    if constants.qt_version == 6:
+        from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
+    elif constants.qt_version == 5:
+        from PyQt5.QtNetwork import QNetworkAccessManager, QNetworkRequest
+    else:
+        QNetworkAccessManager = QNetworkRequest = object  # type: ignore
+except ImportError:
+    QNetworkAccessManager = QNetworkRequest = object  # type: ignore
 
 # --- Anki Imports ---
 try:
@@ -93,6 +120,11 @@ def _build_music_style(night: bool) -> str:
         border-radius: 12px;
         border: 1px solid {c['grey_light']};
     }}
+    QWidget#MiniBar {{
+        background-color: {c['surface']};
+        border-radius: 12px;
+        border: 1px solid {c['grey_light']};
+    }}
     QLabel {{ color: {c['text']}; font-weight: 600; font-size: 13px; }}
     QComboBox {{
         background-color: {c['surface']}; color: {c['text']}; border: 1px solid {c['grey_mid']};
@@ -128,6 +160,28 @@ def _build_music_style(night: bool) -> str:
         background-color: {c['grey_light']};
     }}
     QPushButton#BtnDelTrack:disabled {{ color: {c['grey_mid']}; background-color: {c['surface']}; border-color: {c['grey_light']}; }}
+    QFrame#StreamDivider {{ background-color: {c['grey_light']}; border: none; max-height: 1px; min-height: 1px; }}
+    QLabel#StreamLabel {{ color: {c['grey_mid']}; font-size: 10px; font-weight: 700; }}
+    QPushButton#BtnStream {{
+        background-color: {c['surface']}; border: 1px solid {c['grey_mid']}; border-radius: 8px;
+        padding: 7px 8px; min-height: 16px; font-size: 12px; font-weight: 600; color: {c['text']};
+    }}
+    QPushButton#BtnStream:hover {{ background-color: {c['grey_light']}; border-color: {c['blue']}; }}
+    QPushButton#BtnStream:pressed {{ background-color: {c['grey_mid']}; }}
+    QPushButton#BtnStream:checked {{ background-color: {c['blue']}; border-color: {c['blue']}; color: #ffffff; }}
+    QLabel#NowPlayingLabel {{ color: {c['text']}; font-size: 11px; font-weight: 600; }}
+    QPushButton#BtnStreamCtl {{
+        background-color: {c['surface']}; border: 1px solid {c['grey_mid']}; border-radius: 16px;
+        min-width: 32px; max-width: 32px; min-height: 32px; max-height: 32px; padding: 0px;
+    }}
+    QPushButton#BtnStreamCtl:hover {{ background-color: {c['grey_light']}; border-color: {c['blue']}; }}
+    QPushButton#BtnStreamCtl:pressed {{ background-color: {c['grey_mid']}; }}
+    QPushButton#BtnMiniCtl {{
+        background-color: {c['surface']}; border: 1px solid {c['grey_mid']}; border-radius: 13px;
+        min-width: 26px; max-width: 26px; min-height: 26px; max-height: 26px; padding: 0px;
+    }}
+    QPushButton#BtnMiniCtl:hover {{ background-color: {c['grey_light']}; border-color: {c['blue']}; }}
+    QPushButton#BtnMiniCtl:pressed {{ background-color: {c['grey_mid']}; }}
 """
 
 # Styles computed per-instance at widget creation time (not cached here).
@@ -144,6 +198,66 @@ def _get_image_path(image_name: str) -> Optional[str]:
     media_dir = os.path.join(base_dir, "media")
     full_path = os.path.join(media_dir, image_name)
     return full_path if os.path.isfile(full_path) else None
+
+_SERVICE_ART = {
+    "soundcloud": ("#ff5500", "SoundCloud"),
+    "ytmusic":    ("#ff0000", "YouTube\nMusic"),
+}
+
+def _make_dash_icon(color: str = "#9aa0a6", px: int = 20) -> "QIcon":
+    """A centred horizontal dash icon — a sane 'minimise to bar' glyph."""
+    if QPixmap is object:
+        return QIcon()
+    try:
+        transparent = Qt.GlobalColor.transparent if constants.qt_version == 6 else Qt.transparent
+        antialias = QPainter.RenderHint.Antialiasing if constants.qt_version == 6 else QPainter.Antialiasing
+        cap = Qt.PenCapStyle.RoundCap if constants.qt_version == 6 else Qt.RoundCap
+        pix = QPixmap(px, px)
+        pix.fill(transparent)
+        p = QPainter(pix)
+        p.setRenderHint(antialias)
+        pen = QPen(QColor(color))
+        pen.setWidth(2)
+        pen.setCapStyle(cap)
+        p.setPen(pen)
+        y = px // 2
+        p.drawLine(int(px * 0.28), y, int(px * 0.72), y)
+        p.end()
+        return QIcon(pix)
+    except Exception:
+        return QIcon()
+
+
+def _make_service_art(service_id: str, size) -> Optional["QPixmap"]:
+    """Draw a branded album-art tile for a streaming service (no logo assets)."""
+    info = _SERVICE_ART.get(service_id)
+    if info is None or QPixmap is object:
+        return None
+    color, label = info
+    w, h = size.width(), size.height()
+    try:
+        transparent = Qt.GlobalColor.transparent if constants.qt_version == 6 else Qt.transparent
+        no_pen = Qt.PenStyle.NoPen if constants.qt_version == 6 else Qt.NoPen
+        center = Qt.AlignmentFlag.AlignCenter if constants.qt_version == 6 else Qt.AlignCenter
+        antialias = QPainter.RenderHint.Antialiasing if constants.qt_version == 6 else QPainter.Antialiasing
+        pix = QPixmap(w, h)
+        pix.fill(transparent)
+        p = QPainter(pix)
+        p.setRenderHint(antialias)
+        p.setPen(no_pen)
+        p.setBrush(QColor(color))
+        p.drawRoundedRect(0, 0, w, h, 12, 12)
+        p.setPen(QColor("#ffffff"))
+        f = QFont(_FONT_FAMILY)
+        f.setPointSize(20)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(pix.rect(), center, label)
+        p.end()
+        return pix
+    except Exception:
+        traceback.print_exc()
+        return None
 
 # --- User track storage (survives addon & Anki updates) ---
 
@@ -254,12 +368,16 @@ class MiniMusicPlayer(QDialog):
         super().__init__(parent)
         self.setWindowTitle(_("Focus Music"))
         self.setWindowFlags(Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.CustomizeWindowHint | Qt.WindowType.WindowCloseButtonHint)
-        self.setFixedSize(260, 375)
+        self.setFixedSize(260, 510 if _has_webengine else 375)
         
         self.player: Optional[QMediaPlayer] = None
         self.audio_output: Optional[QAudioOutput] = None
         self._was_playing_before_change = False
         self._backend_error = False
+        self._mode = "local"          # "local" | "soundcloud" | "ytmusic"
+        self._active_stream = None
+        self._last_art_url = None     # de-dupes artwork downloads
+        self._art_net = QNetworkAccessManager(self) if QNetworkAccessManager is not object else None
 
         self.init_backend()
         self.init_ui()
@@ -321,10 +439,18 @@ class MiniMusicPlayer(QDialog):
 
         cursor = Qt.CursorShape.PointingHandCursor if constants.qt_version == 6 else Qt.PointingHandCursor
 
-        # --- Top-right: + and − buttons ---
+        # --- Top row: minimise (left) · + / − (right) ---
         top_row = QHBoxLayout()
         top_row.setContentsMargins(0, 0, 0, 0)
         top_row.setSpacing(5)
+        self.btn_minimise = QPushButton()
+        self.btn_minimise.setObjectName("BtnAddTrack")
+        self.btn_minimise.setFixedSize(24, 24)
+        self.btn_minimise.setIcon(_make_dash_icon())
+        self.btn_minimise.setToolTip(_("Minimise to a compact bar"))
+        self.btn_minimise.setCursor(cursor)
+        self.btn_minimise.clicked.connect(lambda: self._set_minimised(True))
+        top_row.addWidget(self.btn_minimise)
         top_row.addStretch()
         self.btn_add_track = QPushButton("+")
         self.btn_add_track.setObjectName("BtnAddTrack")
@@ -341,7 +467,9 @@ class MiniMusicPlayer(QDialog):
         self.btn_del_track.clicked.connect(self._delete_current_user_track)
         top_row.addWidget(self.btn_add_track)
         top_row.addWidget(self.btn_del_track)
-        main_layout.addLayout(top_row)
+        self.top_bar = QWidget()
+        self.top_bar.setLayout(top_row)
+        main_layout.addWidget(self.top_bar)
 
         self.card = QFrame()
         self.card.setObjectName("CardFrame")
@@ -356,22 +484,45 @@ class MiniMusicPlayer(QDialog):
         card_layout.addWidget(self.img_label, 0, Qt.AlignmentFlag.AlignCenter if constants.qt_version == 6 else Qt.AlignCenter)
         card_layout.addSpacing(14)
 
+        center = Qt.AlignmentFlag.AlignCenter if constants.qt_version == 6 else Qt.AlignCenter
+
         self.track_combo = QComboBox()
         self.populate_tracks()
         self.track_combo.setCursor(cursor)
         self.track_combo.currentIndexChanged.connect(self.on_track_changed)
         card_layout.addWidget(self.track_combo)
 
+        # Now-playing title — shown in place of the track list while streaming.
+        self.now_playing_lbl = QLabel("")
+        self.now_playing_lbl.setObjectName("NowPlayingLabel")
+        self.now_playing_lbl.setAlignment(center)
+        self.now_playing_lbl.setWordWrap(False)
+        self.now_playing_lbl.setFixedHeight(self.track_combo.sizeHint().height())
+        self.now_playing_lbl.setVisible(False)
+        card_layout.addWidget(self.now_playing_lbl)
+
+        # Unified transport row — prev / play / next, mode-aware.
         ctrl_layout = QHBoxLayout()
-        ctrl_layout.setSpacing(10)
+        ctrl_layout.setSpacing(12)
+        self.btn_prev = QPushButton()
+        self.btn_prev.setObjectName("BtnStreamCtl")
+        self.btn_prev.setCursor(cursor)
+        self.btn_prev.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_MediaSkipBackward))
+        self.btn_prev.clicked.connect(self._on_prev)
         self.btn_play = QPushButton()
         self.btn_play.setCheckable(True)
         self.btn_play.setCursor(cursor)
-        self.btn_play.clicked.connect(self.toggle_playback)
+        self.btn_play.clicked.connect(self._on_play)
+        self.btn_next = QPushButton()
+        self.btn_next.setObjectName("BtnStreamCtl")
+        self.btn_next.setCursor(cursor)
+        self.btn_next.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_MediaSkipForward))
+        self.btn_next.clicked.connect(self._on_next)
         self.update_play_icon(False)
-
         ctrl_layout.addStretch()
+        ctrl_layout.addWidget(self.btn_prev)
         ctrl_layout.addWidget(self.btn_play)
+        ctrl_layout.addWidget(self.btn_next)
         ctrl_layout.addStretch()
         card_layout.addLayout(ctrl_layout)
 
@@ -383,8 +534,93 @@ class MiniMusicPlayer(QDialog):
         vol_layout.addWidget(self.slider_vol)
         card_layout.addLayout(vol_layout)
 
+        # --- Source selector (only when QtWebEngine is available) ---
+        if _has_webengine:
+            card_layout.addSpacing(4)
+            divider = QFrame()
+            divider.setObjectName("StreamDivider")
+            divider.setFrameShape(QFrame.Shape.HLine if constants.qt_version == 6 else QFrame.HLine)
+            card_layout.addWidget(divider)
+
+            src_lbl = QLabel(_("SOURCE"))
+            src_lbl.setObjectName("StreamLabel")
+            card_layout.addWidget(src_lbl)
+
+            self.btn_src_local = QPushButton(_("My Library"))
+            self.btn_src_local.setObjectName("BtnStream")
+            self.btn_src_local.setCheckable(True)
+            self.btn_src_local.setCursor(cursor)
+            self.btn_src_local.clicked.connect(lambda: self._set_mode("local"))
+            card_layout.addWidget(self.btn_src_local)
+
+            src_row = QHBoxLayout()
+            src_row.setSpacing(8)
+            self.btn_soundcloud = QPushButton(_("SoundCloud"))
+            self.btn_soundcloud.setObjectName("BtnStream")
+            self.btn_soundcloud.setCheckable(True)
+            self.btn_soundcloud.setCursor(cursor)
+            self.btn_soundcloud.clicked.connect(lambda: self._open_stream("soundcloud"))
+            self.btn_ytmusic = QPushButton(_("YT Music"))
+            self.btn_ytmusic.setObjectName("BtnStream")
+            self.btn_ytmusic.setCheckable(True)
+            self.btn_ytmusic.setCursor(cursor)
+            self.btn_ytmusic.clicked.connect(lambda: self._open_stream("ytmusic"))
+            src_row.addWidget(self.btn_soundcloud)
+            src_row.addWidget(self.btn_ytmusic)
+            card_layout.addLayout(src_row)
+
+            # Poll the active stream for its current track title.
+            self._np_timer = QTimer(self)
+            self._np_timer.setInterval(1500)
+            self._np_timer.timeout.connect(self._poll_now_playing)
+
         main_layout.addWidget(self.card)
-        
+
+        # --- Compact bar (hidden until minimised) ---
+        self.mini_bar = QWidget()
+        self.mini_bar.setObjectName("MiniBar")
+        mb = QHBoxLayout(self.mini_bar)
+        mb.setContentsMargins(8, 5, 8, 5)
+        mb.setSpacing(5)
+        self.mini_thumb = QLabel()
+        self.mini_thumb.setFixedSize(34, 34)
+        self.mini_thumb.setScaledContents(True)
+        self.mini_thumb.setStyleSheet("border:none;background:transparent;border-radius:6px;")
+        self.mini_title = QLabel("")
+        self.mini_title.setObjectName("NowPlayingLabel")
+        self.mini_title.setWordWrap(False)
+        self.mini_prev = QPushButton()
+        self.mini_prev.setObjectName("BtnMiniCtl")
+        self.mini_prev.setCursor(cursor)
+        self.mini_prev.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_MediaSkipBackward))
+        self.mini_prev.clicked.connect(self._on_prev)
+        self.mini_play = QPushButton()
+        self.mini_play.setObjectName("BtnMiniCtl")
+        self.mini_play.setCheckable(True)
+        self.mini_play.setCursor(cursor)
+        self.mini_play.clicked.connect(self._on_play)
+        self.mini_next = QPushButton()
+        self.mini_next.setObjectName("BtnMiniCtl")
+        self.mini_next.setCursor(cursor)
+        self.mini_next.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_MediaSkipForward))
+        self.mini_next.clicked.connect(self._on_next)
+        self.btn_restore = QPushButton()
+        self.btn_restore.setObjectName("BtnMiniCtl")
+        self.btn_restore.setCursor(cursor)
+        self.btn_restore.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_TitleBarMaxButton))
+        self.btn_restore.setToolTip(_("Expand player"))
+        self.btn_restore.clicked.connect(lambda: self._set_minimised(False))
+        mb.addWidget(self.mini_thumb)
+        mb.addWidget(self.mini_title, 1)
+        mb.addWidget(self.mini_prev)
+        mb.addWidget(self.mini_play)
+        mb.addWidget(self.mini_next)
+        mb.addWidget(self.btn_restore)
+        self.mini_bar.setVisible(False)
+        main_layout.addWidget(self.mini_bar)
+
+        self._minimised = False
+        self._update_source_buttons()
         self._apply_track_change_step1()
 
     def populate_tracks(self):
@@ -449,7 +685,9 @@ class MiniMusicPlayer(QDialog):
         if img_path:
             pix = QPixmap(img_path)
             if not pix.isNull():
-                self.img_label.setPixmap(pix.scaled(self.img_label.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation if constants.qt_version == 6 else Qt.SmoothTransformation))
+                self._apply_art(pix)
+        # Local track name shows in the compact bar's title slot.
+        self._set_now_playing(self.track_combo.currentText())
 
         if constants.qt_version == 6:
             self.player.setSource(QUrl(""))
@@ -491,6 +729,39 @@ class MiniMusicPlayer(QDialog):
         icon = self.style().standardIcon(self.style().StandardPixmap.SP_MediaPause if is_playing else self.style().StandardPixmap.SP_MediaPlay)
         self.btn_play.setIcon(icon)
         self.btn_play.setChecked(is_playing)
+        if hasattr(self, "mini_play"):
+            self.mini_play.setIcon(icon)
+            self.mini_play.setChecked(is_playing)
+
+    def _set_minimised(self, flag: bool) -> None:
+        self._minimised = flag
+        self.top_bar.setVisible(not flag)
+        self.card.setVisible(not flag)
+        self.mini_bar.setVisible(flag)
+        if flag:
+            self.setFixedSize(260, 64)
+        else:
+            self.setFixedSize(260, 510 if _has_webengine else 375)
+
+    def _apply_art(self, pix) -> None:
+        """Set the album art on both the full card and the compact bar."""
+        if pix is None or pix.isNull():
+            return
+        ratio = Qt.AspectRatioMode.KeepAspectRatio if constants.qt_version == 6 else Qt.KeepAspectRatio
+        smooth = Qt.TransformationMode.SmoothTransformation if constants.qt_version == 6 else Qt.SmoothTransformation
+        self.img_label.setPixmap(pix.scaled(self.img_label.size(), ratio, smooth))
+        if hasattr(self, "mini_thumb"):
+            self.mini_thumb.setPixmap(pix)   # scaledContents fits it to 40x40
+
+    def _elide_into(self, label, text) -> None:
+        metrics = label.fontMetrics()
+        elide = Qt.TextElideMode.ElideRight if constants.qt_version == 6 else Qt.ElideRight
+        label.setText(metrics.elidedText(text, elide, label.width() or 180))
+
+    def _set_now_playing(self, text) -> None:
+        self._elide_into(self.now_playing_lbl, text)
+        if hasattr(self, "mini_title"):
+            self._elide_into(self.mini_title, text)
 
     def toggle_playback(self):
         if not self.player: return
@@ -502,6 +773,9 @@ class MiniMusicPlayer(QDialog):
             self._was_playing_before_change = True
 
     def change_volume(self, value):
+        if self._mode != "local" and self._active_stream:
+            self._active_stream.set_volume(value / 100.0)
+            return
         if constants.qt_version == 6 and self.audio_output:
             self.audio_output.setVolume(value / 100.0)
         elif self.player:
@@ -582,6 +856,150 @@ class MiniMusicPlayer(QDialog):
         self.on_track_changed()
         if tooltip: tooltip(f'"{title}" removed.')
 
+    # --- Source mode & unified transport ---
+
+    def _open_stream(self, service_id: str) -> None:
+        """Open a streaming service window and switch the player into that mode."""
+        win = open_streaming_service(service_id)
+        if win is None:
+            return
+        self._active_stream = win
+        self._set_mode(service_id)
+
+    def _set_mode(self, mode: str) -> None:
+        """Switch between local library and a streaming source."""
+        self._mode = mode
+        streaming = mode != "local"
+        # Track list & user-track buttons belong to the local library only.
+        self.track_combo.setVisible(not streaming)
+        self.now_playing_lbl.setVisible(streaming)
+        self.btn_add_track.setVisible(not streaming)
+        self.btn_del_track.setVisible(not streaming)
+        self._update_source_buttons()
+        self._last_art_url = None      # force artwork re-fetch for the new source
+
+        if streaming:
+            try:
+                if self.player and self.is_playing():
+                    self.player.pause()
+            except Exception:
+                pass
+            # Provider tile shows immediately; real artwork replaces it if/when
+            # it downloads successfully (otherwise the tile stays as fallback).
+            art = _make_service_art(mode, self.img_label.size())
+            if art is not None and not art.isNull():
+                self._apply_art(art)
+            self._set_now_playing(_("Loading…"))
+            self.update_play_icon(True)
+            if hasattr(self, "_np_timer"):
+                self._np_timer.start()
+            self._poll_now_playing()
+        else:
+            if hasattr(self, "_np_timer"):
+                self._np_timer.stop()
+            # Stop any streaming audio so it doesn't overlap the local player.
+            if self._active_stream is not None:
+                try:
+                    self._active_stream.media_pause()
+                    self._active_stream.set_muted(True)
+                except Exception:
+                    pass
+            # Restore the current local track's artwork and state.
+            self._apply_track_change_step1()
+            self.update_play_icon(self.is_playing())
+
+    def _update_source_buttons(self) -> None:
+        if not hasattr(self, "btn_src_local"):
+            return
+        self.btn_src_local.setChecked(self._mode == "local")
+        self.btn_soundcloud.setChecked(self._mode == "soundcloud")
+        self.btn_ytmusic.setChecked(self._mode == "ytmusic")
+
+    def _on_prev(self) -> None:
+        if self._mode != "local" and self._active_stream:
+            self._active_stream.media_prev()
+            QTimer.singleShot(600, self._poll_now_playing)
+        else:
+            self._cycle_local(-1)
+
+    def _on_next(self) -> None:
+        if self._mode != "local" and self._active_stream:
+            self._active_stream.media_next()
+            QTimer.singleShot(600, self._poll_now_playing)
+        else:
+            self._cycle_local(1)
+
+    def _on_play(self) -> None:
+        if self._mode != "local" and self._active_stream:
+            self._active_stream.media_play()
+            self.update_play_icon(self.btn_play.isChecked())
+        else:
+            self.toggle_playback()
+
+    def _cycle_local(self, delta: int) -> None:
+        n = self.track_combo.count()
+        if n <= 0:
+            return
+        i = self.track_combo.currentIndex()
+        for _step in range(n):
+            i = (i + delta) % n
+            # Skip the separator row (no data, no text).
+            if self.track_combo.itemData(i) is not None or self.track_combo.itemText(i):
+                break
+        self.track_combo.setCurrentIndex(i)
+
+    def _poll_now_playing(self) -> None:
+        win = self._active_stream
+        if win is None or self._mode == "local":
+            return
+        def _apply(info):
+            if not isinstance(info, dict):
+                info = {}
+            text = (info.get("title") or "").strip() or _("Streaming")
+            self._set_now_playing(text)
+            art = (info.get("art") or "").strip()
+            if art:
+                if art != self._last_art_url:
+                    self._fetch_artwork(art)
+            elif self._last_art_url is not None:
+                # Track has no artwork — fall back to the provider tile.
+                self._last_art_url = None
+                tile = _make_service_art(self._mode, self.img_label.size())
+                if tile is not None and not tile.isNull():
+                    self._apply_art(tile)
+        try:
+            win.query_now_playing(_apply)
+        except Exception:
+            pass
+
+    def _fetch_artwork(self, url: str) -> None:
+        """Download the current track's artwork and show it as the album art."""
+        if self._art_net is None or not url.lower().startswith(("http://", "https://")):
+            return
+        self._last_art_url = url
+        try:
+            reply = self._art_net.get(QNetworkRequest(QUrl(url)))
+        except Exception:
+            return
+        reply.finished.connect(lambda: self._on_art_reply(reply, url))
+
+    def _on_art_reply(self, reply, url: str) -> None:
+        try:
+            # Ignore if we've since changed track/source or left streaming.
+            if self._mode == "local" or url != self._last_art_url:
+                return
+            data = reply.readAll()
+            pix = QPixmap()
+            if pix.loadFromData(bytes(data)) and not pix.isNull():
+                self._apply_art(pix)
+        except Exception:
+            pass
+        finally:
+            try:
+                reply.deleteLater()
+            except Exception:
+                pass
+
     def refresh_theme(self) -> None:
         """Re-apply the current theme stylesheet (called after a colour-theme change)."""
         is_night = False
@@ -594,6 +1012,209 @@ class MiniMusicPlayer(QDialog):
     def closeEvent(self, event):
         event.ignore()
         self.hide()
+
+# --- Streaming services (SoundCloud / YouTube Music) ---
+
+# id -> (display title, start URL, blocked main-frame hosts)
+# Blocking main YouTube keeps the YouTube Music player a focus tool, not a
+# doorway back into the YouTube rabbit hole.
+STREAMING_SERVICES = {
+    "soundcloud": ("SoundCloud", "https://soundcloud.com/discover", []),
+    "ytmusic":    ("YouTube Music", "https://music.youtube.com/",
+                   ["www.youtube.com", "m.youtube.com", "youtube.com", "youtu.be"]),
+}
+
+# DOM selectors used to drive each service's own transport controls.
+CONTROL_SELECTORS = {
+    "soundcloud": {"prev": ".skipControl__previous",
+                   "play": ".playControl",
+                   "next": ".skipControl__next"},
+    "ytmusic":    {"prev": ".previous-button",
+                   "play": "#play-pause-button",
+                   "next": ".next-button"},
+}
+
+# Returns {title, art} from the Media Session API (set by both services):
+# "Title — Artist" plus the largest available artwork URL. Falls back to the
+# document title when no media metadata is present.
+_NOWPLAYING_JS = (
+    "(function(){var r={title:'',art:''};try{"
+    "var m=navigator.mediaSession&&navigator.mediaSession.metadata;"
+    "if(m){r.title=m.title+(m.artist?(' \\u2014 '+m.artist):'');"
+    "if(m.artwork&&m.artwork.length){var a=m.artwork[m.artwork.length-1];"
+    "r.art=(a&&a.src)||'';}}}catch(e){}"
+    "if(!r.title){r.title=document.title||'';}return r;})()"
+)
+
+_web_music_windows: dict = {}      # service_id -> WebMusicWindow
+_music_web_profile: Optional["QWebEngineProfile"] = None
+
+
+class _MusicWebPage(QWebEnginePage):
+    """Web page that refuses to navigate the main frame to blocked hosts."""
+
+    def __init__(self, profile, parent=None, blocked_hosts=None):
+        super().__init__(profile, parent)
+        self._blocked = set(blocked_hosts or [])
+
+    def acceptNavigationRequest(self, url, nav_type, is_main_frame):  # noqa: N802
+        try:
+            host = url.host()
+        except Exception:
+            host = ""
+        if is_main_frame and host in self._blocked:
+            if tooltip:
+                tooltip(_("Stay focused — main YouTube is blocked here."))
+            return False
+        try:
+            return super().acceptNavigationRequest(url, nav_type, is_main_frame)
+        except Exception:
+            return True
+
+
+def _get_music_web_profile() -> Optional["QWebEngineProfile"]:
+    """Return a persistent web profile so streaming-service logins survive
+    restarts (mirrors the website sidebar's profile handling)."""
+    global _music_web_profile
+    if _music_web_profile is not None:
+        return _music_web_profile
+    if not _has_webengine or mw is None:
+        return None
+    try:
+        profile_dir = os.path.join(constants.addon_path, "music_web_profile")
+        os.makedirs(profile_dir, exist_ok=True)
+        prof = QWebEngineProfile(f"profile_{constants.ADDON_NAME_LAUNCHER}_Music_v1", mw)
+        prof.setPersistentStoragePath(profile_dir)
+        prof.setPersistentCookiesPolicy(
+            QWebEngineProfile.PersistentCookiesPolicy.AllowPersistentCookies
+        )
+        prof.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+        _music_web_profile = prof
+    except Exception:
+        traceback.print_exc()
+        _music_web_profile = None
+    return _music_web_profile
+
+
+class WebMusicWindow(QDialog):
+    """A resizable window embedding a streaming-service web player."""
+
+    def __init__(self, service_id: str, title: str, url: str, blocked_hosts=None, parent=None):
+        super().__init__(parent)
+        self.service_id = service_id
+        self.setWindowTitle(title)
+        # Stay on top so it surfaces above the always-on-top mini player when
+        # opened; the user can minimise it and keep controlling via the player.
+        flags = (Qt.WindowType.Window | Qt.WindowType.WindowStaysOnTopHint
+                 | Qt.WindowType.WindowCloseButtonHint
+                 | Qt.WindowType.WindowMinMaxButtonsHint)
+        self.setWindowFlags(flags)
+        # Wide enough for the desktop layout so there's no horizontal scroll.
+        self.resize(940, 680)
+        self.setMinimumSize(480, 480)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.view = QWebEngineView(self)
+        prof = _get_music_web_profile()
+        if prof is not None:
+            self.view.setPage(_MusicWebPage(prof, self.view, blocked_hosts))
+        self.view.setUrl(QUrl(url))
+        layout.addWidget(self.view)
+
+    # --- Transport control via the page's own buttons ---
+    def _run_js(self, code: str, callback=None) -> None:
+        try:
+            page = self.view.page()
+            if not page:
+                return
+            if callback is not None:
+                page.runJavaScript(code, callback)
+            else:
+                page.runJavaScript(code)
+        except Exception:
+            pass
+
+    def _click(self, action: str) -> None:
+        sel = CONTROL_SELECTORS.get(self.service_id, {}).get(action)
+        if not sel:
+            return
+        self._run_js(
+            "(function(){var b=document.querySelector(%s);"
+            "if(b){b.click();return true;}return false;})()" % json.dumps(sel)
+        )
+
+    def media_prev(self):  self._click("prev")
+    def media_next(self):  self._click("next")
+    def media_play(self):  self._click("play")
+
+    def set_volume(self, frac: float) -> None:
+        self._run_js(
+            "(function(){var e=document.querySelector('video,audio');"
+            "if(e){try{e.volume=%f;}catch(x){}}})()" % max(0.0, min(1.0, frac))
+        )
+
+    def media_pause(self) -> None:
+        # Pause via the site's *own* play/pause control if something is playing.
+        # Pausing the raw <audio> element isn't enough — SoundCloud's player JS
+        # re-syncs the element back to its internal "playing" state and resumes.
+        # Clicking the site's control flips that internal state, so it stays put.
+        sel = CONTROL_SELECTORS.get(self.service_id, {}).get("play", "")
+        self._run_js(
+            "(function(){try{var playing=false;"
+            "document.querySelectorAll('video,audio').forEach(function(e){"
+            "try{if(!e.paused&&!e.ended){playing=true;}e.pause();}catch(x){}});"
+            "if(playing){var b=document.querySelector(%s);if(b){b.click();}}"
+            "}catch(y){}})()" % json.dumps(sel)
+        )
+
+    def set_muted(self, muted: bool) -> None:
+        # Guaranteed silence: page-level mute works no matter where the audio
+        # element lives (SoundCloud's resists a plain element.pause()).
+        try:
+            page = self.view.page()
+            if page:
+                page.setAudioMuted(bool(muted))
+        except Exception:
+            pass
+
+    def query_now_playing(self, callback) -> None:
+        self._run_js(_NOWPLAYING_JS, callback)
+
+    def closeEvent(self, event):
+        # Hide instead of close so playback continues in the background.
+        event.ignore()
+        self.hide()
+
+
+def open_streaming_service(service_id: str) -> Optional["WebMusicWindow"]:
+    if not _has_webengine:
+        if tooltip:
+            tooltip(_("Streaming player unavailable (QtWebEngine missing)."))
+        return None
+    info = STREAMING_SERVICES.get(service_id)
+    if not info:
+        return None
+    title, url, blocked = info
+    # Only one service audible at a time: pause + mute & hide any other window.
+    for other_id, other in _web_music_windows.items():
+        if other_id != service_id and other is not None:
+            try:
+                other.media_pause()
+                other.set_muted(True)
+                other.hide()
+            except Exception:
+                pass
+    win = _web_music_windows.get(service_id)
+    if win is None:
+        win = WebMusicWindow(service_id, title, url, blocked, mw if mw else None)
+        _web_music_windows[service_id] = win
+    win.set_muted(False)
+    win.show()
+    win.raise_()
+    win.activateWindow()
+    return win
+
 
 # --- Global Control ---
 
@@ -626,3 +1247,10 @@ def cleanup_music_player():
             _music_window.player.stop()
         _music_window.close()
         _music_window = None
+    for win in list(_web_music_windows.values()):
+        try:
+            win.hide()
+            win.deleteLater()
+        except Exception:
+            pass
+    _web_music_windows.clear()
